@@ -229,6 +229,47 @@ class Worker(LocalOrDistributedWorkerBase):
         self.model_runner.save_tensorized_model(
             tensorizer_config=tensorizer_config, )
 
+    def load_sharded_state(self, path: str, pattern: Optional[str] = None):
+        """Load sharded weights from local disk into the running model.
+
+        Mirrors the V1 worker capability so `collective_rpc("load_sharded_state")`
+        works across V0 and V1. Returns a small per-rank result dict.
+
+        Uses the RLHF-like in-place update path by streaming tensors from
+        shard files and calling `model.load_weights([(name, tensor)])` per
+        tensor, preserving parameter storage and graph assumptions.
+        """
+        try:
+            from vllm.worker._weight_update import stream_apply_sharded_state
+            stream_apply_sharded_state(self.model_runner.model, path, pattern)
+            torch.cuda.synchronize()
+            # Flush KV cache after weights change to avoid mixing activations
+            # produced with old weights. We re-initialize cache_engine blocks
+            # in-place without re-warming CUDA graphs (graphs refer to module
+            # weights, but KV contents are ephemeral). Keeping block sizes
+            # identical ensures allocator metadata remains valid.
+            try:
+                if hasattr(self, "cache_engine") and self.cache_engine:
+                    for ve, engine in enumerate(self.cache_engine):
+                        for layer_cache in engine.gpu_cache:
+                            layer_cache.zero_()
+                    # Also clear any bookkeeping for sequence metadata cache.
+                    self._seq_group_metadata_cache.clear()
+                # If gpu_cache is a list of lists (pipeline parallel), ensure
+                # top-level view still matches updated zeroed tensors.
+                if hasattr(self, "gpu_cache") and self.gpu_cache:
+                    pass  # zeroing is in-place; structure unchanged.
+            except Exception:  # noqa: BLE001
+                logger.warning("KV cache flush after weight update failed", exc_info=True)
+            return {"ok": True, "rank": self.rank}
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Failed to load sharded state for rank %s", self.rank)
+            return {
+                "ok": False,
+                "rank": self.rank,
+                "error": str(e),
+            }
+
     @torch.inference_mode()
     def determine_num_available_blocks(self) -> Tuple[int, int]:
         """Profiles the peak memory usage of the model to determine how many

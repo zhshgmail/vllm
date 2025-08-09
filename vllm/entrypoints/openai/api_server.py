@@ -10,6 +10,7 @@ import json
 import multiprocessing
 import multiprocessing.forkserver as forkserver
 import os
+import glob
 import signal
 import socket
 import tempfile
@@ -19,7 +20,8 @@ from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
 from functools import partial
 from http import HTTPStatus
-from typing import Annotated, Any, Callable, Optional
+from typing import Annotated, Any, Optional
+import time
 
 import prometheus_client
 import pydantic
@@ -445,7 +447,13 @@ def engine_client(request: Request) -> EngineClient:
 
 @router.get("/health", response_class=Response)
 async def health(raw_request: Request) -> Response:
-    """Health check."""
+    """Health check.
+
+    Returns 503 while a weight update is in progress.
+    """
+    if getattr(raw_request.app.state, "weight_update_in_progress", False):
+        return Response(status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                        content=b"Updating weights")
     await engine_client(raw_request).check_health()
     return Response(status_code=200)
 
@@ -475,6 +483,199 @@ async def get_server_load_metrics(request: Request):
 async def ping(raw_request: Request) -> Response:
     """Ping check. Endpoint required for SageMaker"""
     return await health(raw_request)
+
+
+@router.post("/update-weights-from-disk")
+async def update_weights_from_disk(raw_request: Request) -> JSONResponse:
+    """Update model weights in-place from a local HF-style sharded checkpoint.
+
+        Body (application/json):
+            - path: str. Local directory containing sharded safetensors files named
+                like 'model-rank-{rank}-part-{part}.safetensors'.
+            - pattern: Optional[str]. Override filename pattern.
+            - pause: Optional[bool] default True. Quiesce scheduler before swap (v1 only).
+            - interrupt: Optional[bool] default True. Abort all ongoing requests immediately (stream ends with finish_reason=abort).
+            - dry_run: Optional[bool] Validate only; do not mutate weights.
+
+    Behavior:
+      - During update, /health returns 503.
+      - Loads the checkpoint shards directly on each worker via collective_rpc.
+      - Logs progress and returns per-rank results.
+    """
+    try:
+        body = await raw_request.json()
+    except Exception:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST,
+                            detail="Invalid JSON body")
+
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST,
+                            detail="Body must be a JSON object")
+
+    path = body.get("path")
+    pattern = body.get("pattern")
+    pause_flag = bool(body.get("pause", True))
+    interrupt_flag = bool(body.get("interrupt", True))
+    dry_run = bool(body.get("dry_run", False))
+    if not path or not isinstance(path, str):
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST,
+                            detail="Missing required field 'path' (str)")
+
+    # Preflight: verify local dir and presence of at least one shard file.
+    try:
+        if not os.path.isdir(path):
+            logger.error("Update weights failed: path is not a directory: %s",
+                         path)
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST,
+                                detail=f"Not a directory: {path}")
+        # Use default sharded pattern structure if none provided
+        if pattern is None:
+            from vllm.model_executor.model_loader.sharded_state_loader import (
+                ShardedStateLoader,)
+            pattern = ShardedStateLoader.DEFAULT_PATTERN
+        wildcard = pattern.format(rank="*", part="*")
+        shard_candidates = glob.glob(os.path.join(path, wildcard))
+        if len(shard_candidates) == 0:
+            logger.error(
+                "Update weights failed: no shard files matching pattern %s in %s",
+                pattern, path)
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST,
+                detail=(
+                    "Unsupported or missing format: expected sharded safetensors files "
+                    f"matching pattern '{pattern}' in directory {path}"
+                ))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Update weights preflight error for path %s", path)
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST,
+                            detail=str(e))
+
+    app = raw_request.app
+    # Determine v1 vs v0 mode (AsyncLLMEngine vs AsyncLLM (v1)).
+    engine = engine_client(raw_request)
+    is_v1 = getattr(engine, "vllm_config", None) is not None and getattr(engine.vllm_config.model_config, "runner_type", None) is not None and hasattr(engine, "collective_rpc") and "v1" in type(engine).__module__
+    if not is_v1:
+        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST,
+                            detail="/update-weights-from-disk supported only in V1 mode for now")
+
+    if getattr(app.state, "weight_update_in_progress", False):
+        raise HTTPException(status_code=HTTPStatus.CONFLICT,
+                            detail="Weight update already in progress")
+
+    setattr(app.state, "weight_update_in_progress", True)
+    logger.info("Weight update start path=%s pattern=%s dry_run=%s pause=%s interrupt=%s", path,
+                pattern, dry_run, pause_flag, interrupt_flag)
+
+    start = time.time()
+    try:
+        # Phase 1 (optional): pause & drain.
+        num_paused_requests = 0
+        num_interrupted_requests = 0
+        if interrupt_flag:
+            # Immediately abort all active requests (returns partial outputs to clients).
+            try:
+                if hasattr(engine, "abort_all_active"):
+                    num_interrupted_requests = await engine.abort_all_active()  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed aborting active requests prior to weight update")
+        if pause_flag:
+            # Best-effort: ask engine to report zero running requests by polling stats logger snapshot.
+            # (Simplified: rely on absence of active server_load_metrics usage.)
+            # TODO: integrate with formal scheduler pause API when available.
+            wait_loops = 0
+            while getattr(app.state, 'server_load_metrics', 0) > 0 and wait_loops < 100:
+                await asyncio.sleep(0.05)
+                wait_loops += 1
+            num_paused_requests = getattr(app.state, 'server_load_metrics', 0)
+
+        # Phase 2: validation (collective per-rank) before mutation.
+        validate_results = await engine.collective_rpc(
+            "validate_sharded_state", args=(path, pattern))
+        overall_mismatches = []
+        total_tensors = 0
+        all_ok = True
+        for vr in validate_results:
+            if isinstance(vr, dict):
+                total_tensors += vr.get("tensor_count", 0)
+                mismatches = vr.get("mismatches", [])
+                if mismatches:
+                    all_ok = False
+                if mismatches:
+                    overall_mismatches.extend([{**m, "rank": vr.get("rank") } for m in mismatches])
+            else:
+                all_ok = False
+                overall_mismatches.append({"kind": "error", "name": "*", "detail": repr(vr)})
+
+        if not all_ok:
+            logger.error("Weight update validation failed; aborting. mismatches=%s", overall_mismatches[:5])
+            return JSONResponse({
+                "ok": False,
+                "dry_run": dry_run,
+                "validation_failed": True,
+                "mismatches": overall_mismatches,
+            }, status_code=HTTPStatus.BAD_REQUEST)
+
+        if dry_run:
+            duration = time.time() - start
+            logger.info("Dry-run weight validation succeeded in %.2fs", duration)
+            return JSONResponse({
+                "ok": True,
+                "dry_run": True,
+                "duration_sec": round(duration, 3),
+                "validated_tensors": total_tensors,
+                "num_paused_requests": num_paused_requests,
+                "num_interrupted_requests": num_interrupted_requests,
+            })
+
+        # Phase 3: apply (collective) now that validation passed.
+        results = await engine.collective_rpc(
+            "load_sharded_state", args=(path, pattern))
+
+        ok_all = True
+        details: list[dict[str, Any]] = []
+        if isinstance(results, (list, tuple)):
+            for r in results:
+                if isinstance(r, dict):
+                    ok_all = ok_all and bool(r.get("ok", False))
+                    details.append(r)
+                else:
+                    ok_all = False
+                    details.append({"ok": False, "error": repr(r)})
+        else:
+            ok_all = False
+            details.append({"ok": False, "error": "Unexpected result"})
+
+        duration = time.time() - start
+        if ok_all:
+            logger.info("Weight update successful in %.2fs tensors=%s", duration, total_tensors)
+            return JSONResponse({
+                "ok": True,
+                "duration_sec": round(duration, 3),
+                "details": details,
+                "validated_tensors": total_tensors,
+                "num_paused_requests": num_paused_requests,
+                "num_interrupted_requests": num_interrupted_requests,
+            }, status_code=HTTPStatus.OK)
+        else:
+            logger.error("Weight update failed: %s", details)
+            return JSONResponse({
+                "ok": False,
+                "duration_sec": round(duration, 3),
+                "details": details,
+            }, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+    except HTTPException:
+        raise
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Weight update failed with exception")
+        return JSONResponse({
+            "ok": False,
+            "error": str(e),
+        }, status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+    finally:
+        # Re-enable health checks.
+        setattr(app.state, "weight_update_in_progress", False)
 
 
 @router.post("/tokenize",

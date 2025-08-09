@@ -440,7 +440,33 @@ class AsyncLLM(EngineClient):
         if self.log_requests:
             logger.info("Aborted request %s.", request_id)
 
-    async def encode(
+    async def abort_all_active(self) -> int:
+        """Abort all active requests, emitting final abort outputs.
+
+        Returns number of aborted request ids.
+        """
+        # Finalize & abort locally (push final outputs to queues).
+        aborted_ids = self.output_processor.finalize_and_abort_all()
+        if aborted_ids:
+            # Propagate to engine core so scheduler frees resources.
+            await self.engine_core.abort_requests_async(aborted_ids)
+        if self.log_requests and aborted_ids:
+            logger.info("Aborted %d active requests (global interrupt).", len(aborted_ids))
+        return len(aborted_ids)
+
+    @staticmethod
+    def _record_stats(
+        stat_loggers: list[StatLoggerBase],
+        scheduler_stats: Optional[SchedulerStats],
+        iteration_stats: Optional[IterationStats],
+    ):
+        """static so that it can be used from the output_handler task
+        without a circular ref to AsyncLLM."""
+        for stat_logger in stat_loggers:
+            stat_logger.record(scheduler_stats=scheduler_stats,
+                               iteration_stats=iteration_stats)
+
+    def encode(
         self,
         prompt: PromptType,
         pooling_params: PoolingParams,
