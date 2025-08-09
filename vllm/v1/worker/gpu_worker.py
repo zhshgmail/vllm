@@ -276,6 +276,7 @@ class Worker(WorkerBase):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
 
+
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 

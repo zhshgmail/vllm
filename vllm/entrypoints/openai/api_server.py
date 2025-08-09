@@ -9,6 +9,7 @@ import inspect
 import json
 import multiprocessing
 import os
+import glob
 import signal
 import socket
 import tempfile
@@ -19,6 +20,7 @@ from contextlib import asynccontextmanager
 from functools import partial
 from http import HTTPStatus
 from typing import Annotated, Any, Optional
+import time
 
 import prometheus_client
 import regex as re
@@ -407,7 +409,13 @@ def engine_client(request: Request) -> EngineClient:
 
 @router.get("/health", response_class=Response)
 async def health(raw_request: Request) -> Response:
-    """Health check."""
+    """Health check.
+
+    Returns 503 while a weight update is in progress.
+    """
+    if getattr(raw_request.app.state, "weight_update_in_progress", False):
+        return Response(status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                        content=b"Updating weights")
     await engine_client(raw_request).check_health()
     return Response(status_code=200)
 
@@ -436,6 +444,8 @@ async def get_server_load_metrics(request: Request):
 async def ping(raw_request: Request) -> Response:
     """Ping check. Endpoint required for SageMaker"""
     return await health(raw_request)
+
+
 
 
 @router.post("/tokenize",
@@ -1024,6 +1034,58 @@ def build_app(args: Namespace) -> FastAPI:
         app = FastAPI(lifespan=lifespan)
     app.include_router(router)
     app.root_path = args.root_path
+
+    # Add weight update API endpoints if enabled
+    if getattr(args, 'enable_weight_update_api', False):
+        from vllm.entrypoints.openai.weight_update_api import (
+            init_nccl_group, update_weights_nccl, get_weight_update_stats, 
+            cleanup_nccl_group, update_weights_from_disk,
+            InitNCCLGroupRequest, NCCLWeightUpdateRequest, DiskWeightUpdateRequest
+        )
+        
+        @router.post("/weights/init-nccl-group")
+        async def init_nccl_group_endpoint(
+            request: InitNCCLGroupRequest,
+            raw_request: Request
+        ):
+            return await init_nccl_group(request, raw_request)
+
+        @router.post("/weights/update-from-nccl")
+        async def update_weights_nccl_endpoint(
+            request: NCCLWeightUpdateRequest,
+            raw_request: Request
+        ):
+            return await update_weights_nccl(request, raw_request)
+
+        @router.get("/weights/stats")
+        async def get_weight_update_stats_endpoint(raw_request: Request):
+            return await get_weight_update_stats(raw_request)
+
+        @router.post("/weights/cleanup-nccl-group")
+        async def cleanup_nccl_group_endpoint(raw_request: Request):
+            return await cleanup_nccl_group(raw_request)
+
+        @router.post("/weights/update-from-disk")
+        async def update_weights_from_disk_endpoint(
+            request: DiskWeightUpdateRequest,
+            raw_request: Request
+        ):
+            result = await update_weights_from_disk(request, raw_request)
+            
+            # Convert DiskWeightUpdateResponse to JSONResponse for API compatibility
+            status_code = HTTPStatus.OK
+            if not result.ok:
+                if result.validation_failed:
+                    status_code = HTTPStatus.BAD_REQUEST
+                elif result.error:
+                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+                else:
+                    status_code = HTTPStatus.INTERNAL_SERVER_ERROR
+            
+            return JSONResponse(
+                content=result.model_dump(exclude_none=True),
+                status_code=status_code
+            )
 
     mount_metrics(app)
 
