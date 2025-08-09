@@ -276,6 +276,67 @@ class Worker(WorkerBase):
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
 
+    def load_sharded_state(self, path: str, pattern: Optional[str] = None):
+        """Load sharded weights from local disk into the running model.
+
+        Expects safetensors shards named like model-rank-{rank}-part-{part}.safetensors
+        residing under `path`. Optionally override the filename `pattern`.
+
+        This mimics RLHF's WorkerExtension path by streaming tensors from
+        shard files and invoking `model.load_weights([(name, tensor)])` for
+        each param, ensuring in-place updates that preserve Parameter storage.
+
+        Returns a small dict indicating success or an error for this rank.
+        """
+        try:
+            from vllm.worker._weight_update import stream_apply_sharded_state
+            stream_apply_sharded_state(self.model_runner.model, path, pattern)
+            torch.cuda.synchronize()
+            # Flush KV cache contents so subsequent requests recompute with new weights.
+            try:
+                # v1 stores KV cache tensors in model_runner.kv_caches (list[Tensor]).
+                # model_runner is already used above; assume it exists here.
+                for kv_tensor in self.model_runner.kv_caches:  # type: ignore[attr-defined]
+                    if torch.is_tensor(kv_tensor):
+                        kv_tensor.zero_()
+                # Drop per-request cached state referencing old KV positions.
+                if hasattr(self.model_runner, "requests"):
+                    self.model_runner.requests.clear()  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                logger.warning("KV cache flush after weight update failed (v1)", exc_info=True)
+            return {"ok": True, "rank": self.rank}
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Failed to load sharded state for rank %s", self.rank)
+            return {
+                "ok": False,
+                "rank": self.rank,
+                "error": str(e),
+            }
+
+    def validate_sharded_state(self, path: str, pattern: Optional[str] = None):
+        """Validate a prospective sharded state without mutating weights.
+
+        Returns dict with tensor_count and mismatches list.
+        """
+        try:
+            from vllm.worker._weight_update import validate_sharded_state
+            tensor_count, mismatches = validate_sharded_state(self.model_runner.model, path, pattern)
+            return {
+                "ok": True,
+                "rank": self.rank,
+                "tensor_count": tensor_count,
+                "mismatches": mismatches,
+            }
+        except Exception as e:  # noqa: BLE001
+            logger.exception("validate_sharded_state failed rank=%s", self.rank)
+            return {
+                "ok": False,
+                "rank": self.rank,
+                "error": str(e),
+                "tensor_count": 0,
+                "mismatches": [{"kind": "error", "name": "*", "detail": str(e)}],
+            }
+
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 

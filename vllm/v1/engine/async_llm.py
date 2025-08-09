@@ -431,6 +431,20 @@ class AsyncLLM(EngineClient):
         if self.log_requests:
             logger.info("Aborted request %s.", request_id)
 
+    async def abort_all_active(self) -> int:
+        """Abort all active requests, emitting final abort outputs.
+
+        Returns number of aborted request ids.
+        """
+        # Finalize & abort locally (push final outputs to queues).
+        aborted_ids = self.output_processor.finalize_and_abort_all()
+        if aborted_ids:
+            # Propagate to engine core so scheduler frees resources.
+            await self.engine_core.abort_requests_async(aborted_ids)
+        if self.log_requests and aborted_ids:
+            logger.info("Aborted %d active requests (global interrupt).", len(aborted_ids))
+        return len(aborted_ids)
+
     @staticmethod
     def _record_stats(
         stat_loggers: list[StatLoggerBase],

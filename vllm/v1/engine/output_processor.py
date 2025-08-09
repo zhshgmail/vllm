@@ -273,6 +273,29 @@ class OutputProcessor:
                     request_ids_to_abort.extend(parent.child_requests)
         return request_ids_to_abort
 
+    def finalize_and_abort_all(self) -> list[str]:
+        """Emit a final abort output for every active request and remove it.
+
+        This is used for global interruption events (e.g. weight update)
+        where we must terminate all generators promptly while returning
+        whatever has been produced so far to the client.
+        """
+        aborted: list[str] = []
+        # Iterate over a list copy since we mutate request_states.
+        for req_id, req_state in list(self.request_states.items()):
+            # Produce a final RequestOutput with finish_reason=ABORT.
+            try:
+                ro = req_state.make_request_output([], FinishReason.ABORT, None)
+                if ro is not None and req_state.queue is not None:
+                    req_state.queue.put(ro)
+            except Exception as e:  # pragma: no cover - defensive
+                if req_state.queue is not None:
+                    req_state.queue.put(e)
+            aborted.append(req_id)
+        # Remove all states & propagate to LoRA tracking.
+        self.abort_requests(aborted)
+        return aborted
+
     def add_request(
         self,
         request: EngineCoreRequest,
