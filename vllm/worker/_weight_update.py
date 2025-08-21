@@ -8,6 +8,8 @@ streams tensors from safetensors shards and applies them via the model's
 from __future__ import annotations
 from typing import Optional, Tuple, List, Dict
 
+# NOTE: Keep this file light. Minimal logic to tolerate split q/k/v & gate/up
+# shards when model exposes fused qkv_proj / gate_up_proj parameters.
 
 def stream_apply_sharded_state(model, path: str, pattern: Optional[str] = None) -> int:
     """Stream sharded state tensors into an existing model.
@@ -29,6 +31,27 @@ def stream_apply_sharded_state(model, path: str, pattern: Optional[str] = None) 
     )
     from vllm.transformers_utils.s3_utils import glob as s3_glob
     from vllm.transformers_utils.utils import is_s3
+
+    # Handle single model.safetensors file case
+    if pattern == "model.safetensors":
+        import os
+        single_file_path = os.path.join(path, "model.safetensors")
+        
+        if os.path.exists(single_file_path):
+            from safetensors import safe_open
+            updated = 0
+            model_params = set(dict(model.named_parameters()).keys())
+            
+            with safe_open(single_file_path, framework="pt", device="cpu") as f:
+                for key in f.keys():
+                    # Skip lm_head.weight if model doesn't expect it (tied weights)
+                    if key == "lm_head.weight" and key not in model_params:
+                        continue
+                    tensor = f.get_tensor(key)
+                    model.load_weights(weights=[(key, tensor)])
+                    updated += 1
+            
+            return updated
 
     load_cfg = LoadConfig(load_format="sharded_state", model_loader_extra_config={})
     loader = ShardedStateLoader(load_cfg)
@@ -71,8 +94,16 @@ def stream_apply_sharded_state(model, path: str, pattern: Optional[str] = None) 
     qkv_pat = re.compile(r"^(.*)\.(q|k|v)_proj\.(weight|bias)$")
     gate_pat = re.compile(r"^(.*)\.(gate|up)_proj\.(weight|bias)$")
 
+    # Get model parameters to handle tied weights
+    model_params = set(dict(model.named_parameters()).keys())
+
     for key, tensor in loader.iterate_over_files(filepaths):
         key = _normalize(key)
+        
+        # Skip lm_head.weight if model doesn't expect it (tied weights)
+        if key == "lm_head.weight" and key not in model_params:
+            continue
+            
         # Direct hit (already fused or unrelated param not a split weight/bias)
         if key in fused_shapes or (not key.endswith("_proj.weight") and not key.endswith("_proj.bias")):
             model.load_weights(weights=[(key, tensor)])  # type: ignore[attr-defined]
@@ -110,6 +141,7 @@ def stream_apply_sharded_state(model, path: str, pattern: Optional[str] = None) 
     # Fallback (unfused architecture or unexpected name): always load as-is.
         model.load_weights(weights=[(key, tensor)])  # type: ignore[attr-defined]
         updated += 1
+    
     return updated
 
 
@@ -124,6 +156,21 @@ def validate_sharded_state(model, path: str, pattern: Optional[str] = None) -> T
     )
     from vllm.transformers_utils.s3_utils import glob as s3_glob
     from vllm.transformers_utils.utils import is_s3
+
+    # Handle single model.safetensors file case
+    if pattern == "model.safetensors":
+        single_file_path = os.path.join(path, "model.safetensors")
+        if os.path.exists(single_file_path):
+            from safetensors import safe_open
+            model_params = set(dict(model.named_parameters()).keys())
+            with safe_open(single_file_path, framework="pt", device="cpu") as f:
+                count = 0
+                for key in f.keys():
+                    # Skip lm_head.weight if model doesn't expect it
+                    if key == "lm_head.weight" and key not in model_params:
+                        continue
+                    count += 1
+                return count, []  # No validation errors for single file
 
     # Build expected map
     expected: Dict[str, Tuple[Tuple[int, ...], str]] = {}
@@ -294,3 +341,4 @@ def validate_sharded_state(model, path: str, pattern: Optional[str] = None) -> T
         })
 
     return count, mismatches
+
