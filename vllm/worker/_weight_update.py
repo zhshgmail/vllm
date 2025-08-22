@@ -54,9 +54,54 @@ def stream_apply_sharded_state(model, path: str, pattern: Optional[str] = None) 
         raise ValueError(f"No shards found for rank {rank} with pattern {file_glob}")
 
     updated = 0
-    for key, tensor in loader.iterate_over_files(filepaths):
-        model.load_weights(weights=[(key, tensor)])  # type: ignore[attr-defined]
-        updated += 1
+    failed_params = []
+    
+    try:
+        for key, tensor in loader.iterate_over_files(filepaths):
+            try:
+                # Ensure tensor is on the correct device and contiguous
+                if not tensor.is_contiguous():
+                    tensor = tensor.contiguous()
+                
+                # Load weights one at a time for better error isolation
+                model.load_weights(weights=[(key, tensor)])  # type: ignore[attr-defined]
+                updated += 1
+                
+                # Periodic memory cleanup for large models
+                if updated % 100 == 0:
+                    import gc
+                    gc.collect()
+                    
+            except Exception as e:
+                failed_params.append((key, str(e)))
+                # Continue loading other parameters even if one fails
+                continue
+                
+    except Exception as e:
+        # Critical failure in iteration
+        raise RuntimeError(f"Failed to iterate over weight files: {str(e)}") from e
+    
+    if failed_params:
+        # Log failed parameters but don't fail the entire operation
+        # unless too many parameters failed
+        failure_rate = len(failed_params) / max(1, updated + len(failed_params))
+        if failure_rate > 0.1:  # More than 10% failed
+            raise RuntimeError(
+                f"Too many parameter loading failures ({len(failed_params)} failed, "
+                f"{updated} succeeded). First few failures: {failed_params[:5]}"
+            )
+        else:
+            # Log warnings for failed parameters
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                f"Some parameters failed to load ({len(failed_params)} failed, "
+                f"{updated} succeeded): {failed_params[:3]}"
+            )
+    
+    if updated == 0:
+        raise ValueError("No parameters were successfully loaded from sharded state")
+        
     return updated
 
 

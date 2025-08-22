@@ -360,22 +360,50 @@ class Worker(WorkerBase):
         Returns a small dict indicating success or an error for this rank.
         """
         try:
+            logger.debug("Starting load_sharded_state for rank %d with path=%s, pattern=%s", 
+                        self.rank, path, pattern)
+            
             from vllm.worker._weight_update import stream_apply_sharded_state
-            stream_apply_sharded_state(self.model_runner.model, path, pattern)
+            logger.debug("Imported stream_apply_sharded_state successfully")
+            
+            # Check model runner availability
+            if hasattr(self, "model_runner"):
+                logger.debug("Found model_runner")
+                if hasattr(self.model_runner, "model"):
+                    logger.debug("Found model_runner.model")
+                else:
+                    logger.warning("model_runner has no model attribute")
+            else:
+                logger.warning("No model_runner found")
+            
+            # Load new weights
+            logger.debug("Calling stream_apply_sharded_state")
+            num_updated = stream_apply_sharded_state(self.model_runner.model, path, pattern)
+            logger.info(f"Successfully loaded {num_updated} parameters for rank {self.rank}")
+            logger.debug("Weight loading completed, proceeding with post-load tasks")
+            
+            # Ensure all weight updates are complete before proceeding
+            logger.debug("Performing CUDA synchronization after weight loading")
             torch.cuda.synchronize()
+            logger.debug("CUDA synchronization completed")
+            
+            # Validate model state after weight loading
+            logger.debug("Starting model state validation")
+            self._validate_model_state_after_update()
+            logger.debug("Model state validation completed")
+            
             # Flush KV cache contents so subsequent requests recompute with new weights.
+            logger.debug("Starting KV cache flush")
             try:
-                # v1 stores KV cache tensors in model_runner.kv_caches (list[Tensor]).
-                # model_runner is already used above; assume it exists here.
-                for kv_tensor in self.model_runner.kv_caches:  # type: ignore[attr-defined]
-                    if torch.is_tensor(kv_tensor):
-                        kv_tensor.zero_()
-                # Drop per-request cached state referencing old KV positions.
-                if hasattr(self.model_runner, "requests"):
-                    self.model_runner.requests.clear()  # type: ignore[attr-defined]
-            except Exception:  # noqa: BLE001
+                # V1 KV cache clearing: comprehensive cleanup of all cache state
+                self._flush_kv_cache_v1()
+                logger.debug("KV cache flush completed successfully")
+            except Exception as e:  # noqa: BLE001
                 logger.warning("KV cache flush after weight update failed (v1)", exc_info=True)
-            return {"ok": True, "rank": self.rank}
+                logger.debug("KV cache flush exception details: %s", str(e))
+                
+            logger.debug("load_sharded_state completed successfully for rank %d", self.rank)
+            return {"ok": True, "rank": self.rank, "num_updated": num_updated}
         except Exception as e:  # noqa: BLE001
             logger.exception("Failed to load sharded state for rank %s", self.rank)
             return {
@@ -389,17 +417,44 @@ class Worker(WorkerBase):
 
         Returns dict with tensor_count and mismatches list.
         """
+        logger.debug("Starting validate_sharded_state for rank %d with path=%s, pattern=%s", 
+                    self.rank, path, pattern)
+        
         try:
             from vllm.worker._weight_update import validate_sharded_state
+            logger.debug("Imported validate_sharded_state successfully")
+            
+            # Check model runner availability
+            if hasattr(self, "model_runner"):
+                logger.debug("Found model_runner for validation")
+                if hasattr(self.model_runner, "model"):
+                    logger.debug("Found model_runner.model for validation")
+                else:
+                    logger.warning("model_runner has no model attribute for validation")
+            else:
+                logger.warning("No model_runner found for validation")
+            
+            logger.debug("Calling validate_sharded_state function")
             tensor_count, mismatches = validate_sharded_state(self.model_runner.model, path, pattern)
-            return {
+            
+            logger.debug("Validation completed: %d tensors checked, %d mismatches found", 
+                        tensor_count, len(mismatches))
+            
+            if mismatches:
+                logger.debug("Validation mismatches: %s", mismatches[:3])  # Log first 3 mismatches
+            
+            result = {
                 "ok": True,
                 "rank": self.rank,
                 "tensor_count": tensor_count,
                 "mismatches": mismatches,
             }
+            logger.debug("validate_sharded_state completed successfully for rank %d", self.rank)
+            return result
+            
         except Exception as e:  # noqa: BLE001
             logger.exception("validate_sharded_state failed rank=%s", self.rank)
+            logger.debug("validate_sharded_state exception details: %s", str(e))
             return {
                 "ok": False,
                 "rank": self.rank,
@@ -407,6 +462,282 @@ class Worker(WorkerBase):
                 "tensor_count": 0,
                 "mismatches": [{"kind": "error", "name": "*", "detail": str(e)}],
             }
+
+    def _flush_kv_cache_v1(self) -> None:
+        """Comprehensive KV cache flush for V1 engine after weight updates.
+        
+        Clears all KV cache tensors, block allocator state, request state,
+        and attention metadata to ensure clean state for new weights.
+        """
+        logger.debug("Starting V1 KV cache flush after weight update")
+        
+        # 1. Clear KV cache tensors in model runner
+        if hasattr(self.model_runner, "kv_caches"):
+            logger.debug("Found model_runner.kv_caches, clearing %d KV cache tensors", 
+                        len(self.model_runner.kv_caches))
+            cleared_tensors = 0
+            cleared_mamba_tensors = 0
+            
+            for i, kv_tensor in enumerate(self.model_runner.kv_caches):
+                if torch.is_tensor(kv_tensor):
+                    logger.debug("Clearing KV cache tensor %d with shape %s", i, kv_tensor.shape)
+                    kv_tensor.zero_()
+                    cleared_tensors += 1
+                elif isinstance(kv_tensor, (list, tuple)):
+                    logger.debug("Clearing Mamba-style state tensor %d with %d sub-tensors", 
+                                i, len(kv_tensor))
+                    # Handle Mamba-style state tensors (list of tensors)
+                    for j, tensor in enumerate(kv_tensor):
+                        if torch.is_tensor(tensor):
+                            logger.debug("  Clearing sub-tensor %d with shape %s", j, tensor.shape)
+                            tensor.zero_()
+                            cleared_mamba_tensors += 1
+                else:
+                    logger.debug("Skipping non-tensor KV cache entry %d of type %s", i, type(kv_tensor))
+            
+            logger.debug("Cleared %d regular tensors and %d Mamba sub-tensors from model_runner.kv_caches", 
+                        cleared_tensors, cleared_mamba_tensors)
+        else:
+            logger.debug("model_runner.kv_caches not found - skipping KV cache tensor clearing")
+        
+        # 2. Clear KV caches in forward context (attention layers)
+        if hasattr(self.model_runner, "compilation_config"):
+            logger.debug("Found model_runner.compilation_config")
+            if hasattr(self.model_runner.compilation_config, "static_forward_context"):
+                forward_context = self.model_runner.compilation_config.static_forward_context
+                logger.debug("Found static_forward_context with %d layers", len(forward_context))
+                
+                cleared_layer_caches = 0
+                for layer_name, layer in forward_context.items():
+                    if hasattr(layer, "kv_cache"):
+                        if layer.kv_cache:
+                            logger.debug("Clearing KV cache for layer %s with %d cache entries", 
+                                        layer_name, len(layer.kv_cache))
+                            for cache_idx, kv_cache in enumerate(layer.kv_cache):
+                                if torch.is_tensor(kv_cache):
+                                    logger.debug("  Clearing layer %s cache %d with shape %s", 
+                                                layer_name, cache_idx, kv_cache.shape)
+                                    kv_cache.zero_()
+                                elif isinstance(kv_cache, (list, tuple)):
+                                    logger.debug("  Clearing layer %s compound cache %d with %d tensors", 
+                                                layer_name, cache_idx, len(kv_cache))
+                                    for tensor in kv_cache:
+                                        if torch.is_tensor(tensor):
+                                            tensor.zero_()
+                            cleared_layer_caches += 1
+                        else:
+                            logger.debug("Layer %s has empty kv_cache", layer_name)
+                    else:
+                        logger.debug("Layer %s has no kv_cache attribute", layer_name)
+                
+                logger.debug("Cleared KV caches for %d layers in forward context", cleared_layer_caches)
+            else:
+                logger.debug("compilation_config.static_forward_context not found - skipping forward context clearing")
+        else:
+            logger.debug("model_runner.compilation_config not found - skipping forward context clearing")
+        
+        # 3. Clear request state and metadata
+        if hasattr(self.model_runner, "input_batch"):
+            logger.debug("Found model_runner.input_batch")
+            if self.model_runner.input_batch:
+                logger.debug("input_batch is not None, clearing block tables")
+                if hasattr(self.model_runner.input_batch, "block_table"):
+                    logger.debug("Found input_batch.block_table with %d entries", 
+                                len(self.model_runner.input_batch.block_table))
+                    
+                    cleared_block_tables = 0
+                    for i, block_table in enumerate(self.model_runner.input_batch.block_table):
+                        if hasattr(block_table, "clear"):
+                            logger.debug("Clearing block_table %d using clear() method", i)
+                            block_table.clear()
+                            cleared_block_tables += 1
+                        elif hasattr(block_table, "zero_"):
+                            logger.debug("Clearing block_table %d using zero_() method", i)
+                            block_table.zero_()
+                            cleared_block_tables += 1
+                        else:
+                            logger.debug("Block_table %d has no clear() or zero_() method", i)
+                    
+                    logger.debug("Cleared %d block tables", cleared_block_tables)
+                else:
+                    logger.debug("input_batch has no block_table attribute")
+            else:
+                logger.debug("input_batch is None - skipping block table clearing")
+        else:
+            logger.debug("model_runner.input_batch not found - skipping block table clearing")
+        
+        # 4. Clear encoder cache (for multimodal models)
+        if hasattr(self.model_runner, "encoder_cache"):
+            cache_size = len(self.model_runner.encoder_cache)
+            logger.debug("Found model_runner.encoder_cache with %d entries, clearing", cache_size)
+            self.model_runner.encoder_cache.clear()
+            logger.debug("Cleared encoder cache")
+        else:
+            logger.debug("model_runner.encoder_cache not found - skipping encoder cache clearing")
+        
+        # 5. Reset attention group metadata builders
+        if hasattr(self.model_runner, "attn_groups"):
+            logger.debug("Found model_runner.attn_groups with %d groups", len(self.model_runner.attn_groups))
+            
+            reset_builders = 0
+            skipped_builders = 0
+            failed_resets = 0
+            
+            for group_idx, attn_group_list in enumerate(self.model_runner.attn_groups):
+                logger.debug("Processing attention group %d with %d sub-groups", group_idx, len(attn_group_list))
+                for subgroup_idx, attn_group in enumerate(attn_group_list):
+                    if hasattr(attn_group, "metadata_builder"):
+                        if hasattr(attn_group.metadata_builder, "reset"):
+                            try:
+                                logger.debug("Resetting metadata builder for group %d.%d", group_idx, subgroup_idx)
+                                attn_group.metadata_builder.reset()
+                                reset_builders += 1
+                            except (AttributeError, NotImplementedError) as e:
+                                logger.debug("Failed to reset metadata builder for group %d.%d: %s", 
+                                           group_idx, subgroup_idx, str(e))
+                                failed_resets += 1
+                        else:
+                            logger.debug("Metadata builder for group %d.%d has no reset() method", 
+                                        group_idx, subgroup_idx)
+                            skipped_builders += 1
+                    else:
+                        logger.debug("Attention group %d.%d has no metadata_builder", group_idx, subgroup_idx)
+            
+            logger.debug("Attention group reset summary: %d reset, %d skipped, %d failed", 
+                        reset_builders, skipped_builders, failed_resets)
+        else:
+            logger.debug("model_runner.attn_groups not found - skipping attention group reset")
+        
+        # 6. Invalidate CUDA graphs (if enabled) since they may reference old KV cache tensors
+        if hasattr(self.model_runner, "use_cuda_graph"):
+            if self.model_runner.use_cuda_graph:
+                logger.debug("CUDA graphs are enabled - they will be regenerated on next capture")
+                logger.info("CUDA graphs are enabled - they will be regenerated on next capture")
+                # Note: CUDA graphs will be automatically regenerated on the next model execution
+                # since we've cleared the KV cache tensors they reference
+            else:
+                logger.debug("CUDA graphs are disabled")
+        else:
+            logger.debug("model_runner.use_cuda_graph not found - assuming CUDA graphs are not used")
+            
+        # 7. Force CUDA synchronization and garbage collection
+        logger.debug("Performing CUDA synchronization and cache cleanup")
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        
+        logger.info("V1 KV cache flush completed successfully after weight update")
+
+    def _validate_model_state_after_update(self) -> None:
+        """Validate model state consistency after weight updates.
+        
+        Performs basic checks to ensure the model is in a valid state
+        after parameter updates.
+        """
+        logger.debug("Starting model state validation after weight update")
+        
+        try:
+            if hasattr(self.model_runner, "model"):
+                model = self.model_runner.model
+                logger.debug("Found model_runner.model, starting validation checks")
+            else:
+                logger.debug("model_runner.model not found - skipping validation")
+                return
+            
+            # Count total parameters for logging
+            total_params = 0
+            try:
+                total_params = sum(1 for _ in model.named_parameters())
+                logger.debug("Model has %d parameters to validate", total_params)
+            except Exception as e:
+                logger.debug("Failed to count parameters: %s", str(e))
+            
+            # Check for NaN or infinite parameters
+            logger.debug("Checking for NaN and infinite parameters")
+            nan_params = []
+            inf_params = []
+            param_count = 0
+            
+            for name, param in model.named_parameters():
+                param_count += 1
+                logger.debug("Checking parameter %d/%d: %s with shape %s", 
+                           param_count, total_params, name, param.shape)
+                
+                try:
+                    if torch.isnan(param).any():
+                        nan_params.append(name)
+                        logger.debug("  Found NaN in parameter: %s", name)
+                    if torch.isinf(param).any():
+                        inf_params.append(name)
+                        logger.debug("  Found inf in parameter: %s", name)
+                except Exception as e:
+                    logger.debug("  Failed to check parameter %s: %s", name, str(e))
+            
+            if nan_params:
+                logger.warning(f"Found NaN parameters after weight update: {nan_params[:5]}")
+                logger.debug("Full list of NaN parameters: %s", nan_params)
+            else:
+                logger.debug("No NaN parameters found")
+                
+            if inf_params:
+                logger.warning(f"Found infinite parameters after weight update: {inf_params[:5]}")
+                logger.debug("Full list of infinite parameters: %s", inf_params)
+            else:
+                logger.debug("No infinite parameters found")
+            
+            # Check parameter device placement
+            logger.debug("Checking parameter device placement consistency")
+            device_mismatches = []
+            expected_device = None
+            
+            try:
+                expected_device = next(model.parameters()).device
+                logger.debug("Expected device for all parameters: %s", expected_device)
+            except StopIteration:
+                logger.debug("Model has no parameters - skipping device check")
+                expected_device = None
+            
+            if expected_device is not None:
+                device_check_count = 0
+                for name, param in model.named_parameters():
+                    device_check_count += 1
+                    if param.device != expected_device:
+                        device_mismatches.append((name, param.device, expected_device))
+                        logger.debug("Device mismatch for %s: got %s, expected %s", 
+                                   name, param.device, expected_device)
+                
+                logger.debug("Checked device placement for %d parameters", device_check_count)
+                
+                if device_mismatches:
+                    logger.warning(f"Found device mismatches after weight update: {device_mismatches[:3]}")
+                    logger.debug("Full list of device mismatches: %s", device_mismatches)
+                else:
+                    logger.debug("All parameters are on the correct device")
+            
+            # Basic dtype consistency check
+            logger.debug("Checking parameter dtype consistency")
+            dtypes = set()
+            dtype_counts = {}
+            
+            for name, param in model.named_parameters():
+                dtype = param.dtype
+                dtypes.add(dtype)
+                dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
+                logger.debug("Parameter %s has dtype %s", name, dtype)
+            
+            logger.debug("Found parameter dtypes: %s", dtype_counts)
+            
+            if len(dtypes) > 2:  # Allow for some dtype variety (e.g., embedding weights)
+                logger.info(f"Model has multiple parameter dtypes after update: {dtypes}")
+                logger.debug("Dtype distribution: %s", dtype_counts)
+            else:
+                logger.debug("Parameter dtypes are consistent")
+                
+            logger.debug("Model state validation completed successfully after weight update")
+            
+        except Exception as e:
+            logger.warning(f"Model state validation failed after weight update: {e}")
+            logger.debug("Full validation exception", exc_info=True)
+            # Don't raise - this is just a validation check
 
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()

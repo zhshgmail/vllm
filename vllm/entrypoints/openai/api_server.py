@@ -553,12 +553,16 @@ async def update_weights_from_disk(raw_request: Request) -> JSONResponse:
                             detail=str(e))
 
     app = raw_request.app
-    # Determine v1 vs v0 mode (AsyncLLMEngine vs AsyncLLM (v1)).
+    # Determine v1 vs v0 mode - only V1 is supported for weight updates
     engine = engine_client(raw_request)
-    is_v1 = getattr(engine, "vllm_config", None) is not None and getattr(engine.vllm_config.model_config, "runner_type", None) is not None and hasattr(engine, "collective_rpc") and "v1" in type(engine).__module__
-    if not is_v1:
-        raise HTTPException(status_code=HTTPStatus.BAD_REQUEST,
-                            detail="/update-weights-from-disk supported only in V1 mode for now")
+    from vllm.v1.engine.async_llm import AsyncLLM as AsyncLLMV1
+    
+    if not isinstance(engine, AsyncLLMV1):
+        raise HTTPException(
+            status_code=HTTPStatus.BAD_REQUEST,
+            detail="Weight updates are only supported in V1 engine mode. "
+                   "Please restart vLLM with V1 engine to use this feature."
+        )
 
     if getattr(app.state, "weight_update_in_progress", False):
         raise HTTPException(status_code=HTTPStatus.CONFLICT,
