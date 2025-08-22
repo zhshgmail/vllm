@@ -97,50 +97,107 @@ def stream_apply_sharded_state(model, path: str, pattern: Optional[str] = None) 
     # Get model parameters to handle tied weights
     model_params = set(dict(model.named_parameters()).keys())
 
-    for key, tensor in loader.iterate_over_files(filepaths):
-        key = _normalize(key)
-        
-        # Skip lm_head.weight if model doesn't expect it (tied weights)
-        if key == "lm_head.weight" and key not in model_params:
-            continue
-            
-        # Direct hit (already fused or unrelated param not a split weight/bias)
-        if key in fused_shapes or (not key.endswith("_proj.weight") and not key.endswith("_proj.bias")):
-            model.load_weights(weights=[(key, tensor)])  # type: ignore[attr-defined]
-            updated += 1
-            continue
-        m = qkv_pat.match(key)
-        if m:
-            prefix, which, kind = m.group(1), m.group(2), m.group(3)
-            fused_name = f"{prefix}.qkv_proj.{kind}"
-            if fused_name in fused_shapes:
-                # Model exposes fused qkv_proj; let its internal loader stack split shards.
-                if kind == "bias" and fused_name not in fused_shapes:
-                    # No fused bias param present.
+    failed_params = []
+    
+    try:
+        for key, tensor in loader.iterate_over_files(filepaths):
+            try:
+                key = _normalize(key)
+                
+                # Skip lm_head.weight if model doesn't expect it (tied weights)
+                if key == "lm_head.weight" and key not in model_params:
                     continue
+                
+                # Ensure tensor is on the correct device and contiguous
+                if not tensor.is_contiguous():
+                    tensor = tensor.contiguous()
+                    
+                # Direct hit (already fused or unrelated param not a split weight/bias)
+                if key in fused_shapes or (not key.endswith("_proj.weight") and not key.endswith("_proj.bias")):
+                    model.load_weights(weights=[(key, tensor)])  # type: ignore[attr-defined]
+                    updated += 1
+                    # Periodic memory cleanup for large models
+                    if updated % 100 == 0:
+                        import gc
+                        gc.collect()
+                    continue
+                    
+                m = qkv_pat.match(key)
+                if m:
+                    prefix, which, kind = m.group(1), m.group(2), m.group(3)
+                    fused_name = f"{prefix}.qkv_proj.{kind}"
+                    if fused_name in fused_shapes:
+                        # Model exposes fused qkv_proj; let its internal loader stack split shards.
+                        if kind == "bias" and fused_name not in fused_shapes:
+                            # No fused bias param present.
+                            continue
+                        model.load_weights(weights=[(key, tensor)])  # type: ignore[attr-defined]
+                        updated += 1
+                        # Periodic memory cleanup for large models
+                        if updated % 100 == 0:
+                            import gc
+                            gc.collect()
+                        continue
+                    elif kind == "bias":
+                        # No fused bias expected; skip split bias.
+                        continue
+                        
+                m2 = gate_pat.match(key)
+                if m2:
+                    prefix, which, kind = m2.group(1), m2.group(2), m2.group(3)
+                    norm_prefix = prefix[:-5] if prefix.endswith('.gate') else prefix
+                    fused_name = f"{norm_prefix}.gate_up_proj.{kind}"
+                    if fused_name in fused_shapes:
+                        # Let model loader stack gate/up shards; don't pre-concatenate to avoid substring replacement.
+                        if kind == "bias" and fused_name not in fused_shapes:
+                            continue
+                        model.load_weights(weights=[(key, tensor)])  # type: ignore[attr-defined]
+                        updated += 1
+                        # Periodic memory cleanup for large models
+                        if updated % 100 == 0:
+                            import gc
+                            gc.collect()
+                        continue
+                    elif kind == "bias":
+                        continue
+                        
+                # Fallback (unfused architecture or unexpected name): always load as-is.
                 model.load_weights(weights=[(key, tensor)])  # type: ignore[attr-defined]
                 updated += 1
+                # Periodic memory cleanup for large models
+                if updated % 100 == 0:
+                    import gc
+                    gc.collect()
+                    
+            except Exception as e:
+                failed_params.append((key, str(e)))
+                # Continue loading other parameters even if one fails
                 continue
-            elif kind == "bias":
-                # No fused bias expected; skip split bias.
-                continue
-        m2 = gate_pat.match(key)
-        if m2:
-            prefix, which, kind = m2.group(1), m2.group(2), m2.group(3)
-            norm_prefix = prefix[:-5] if prefix.endswith('.gate') else prefix
-            fused_name = f"{norm_prefix}.gate_up_proj.{kind}"
-            if fused_name in fused_shapes:
-                # Let model loader stack gate/up shards; don't pre-concatenate to avoid substring replacement.
-                if kind == "bias" and fused_name not in fused_shapes:
-                    continue
-                model.load_weights(weights=[(key, tensor)])  # type: ignore[attr-defined]
-                updated += 1
-                continue
-            elif kind == "bias":
-                continue
-    # Fallback (unfused architecture or unexpected name): always load as-is.
-        model.load_weights(weights=[(key, tensor)])  # type: ignore[attr-defined]
-        updated += 1
+                
+    except Exception as e:
+        # Critical failure in iteration
+        raise RuntimeError(f"Failed to iterate over weight files: {str(e)}") from e
+    
+    if failed_params:
+        # Log failed parameters but don't fail the entire operation
+        # unless too many parameters failed
+        failure_rate = len(failed_params) / max(1, updated + len(failed_params))
+        if failure_rate > 0.1:  # More than 10% failed
+            raise RuntimeError(
+                f"Too many parameter loading failures ({len(failed_params)} failed, "
+                f"{updated} succeeded). First few failures: {failed_params[:5]}"
+            )
+        else:
+            # Log warnings for failed parameters
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(
+                f"Some parameters failed to load ({len(failed_params)} failed, "
+                f"{updated} succeeded): {failed_params[:3]}"
+            )
+    
+    if updated == 0:
+        raise ValueError("No parameters were successfully loaded from sharded state")
     
     return updated
 
