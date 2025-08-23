@@ -17,6 +17,14 @@ class DummyModel:
     def __init__(self):
         self.updates = []  # list of (name, tensor)
         self.failing_params = set()  # Parameters that should fail to load
+        self._parameters = {
+            "layer.weight": FakeTensor((2, 3)),
+            "layer.bias": FakeTensor((3,)),
+        }
+
+    def named_parameters(self, recurse=True):
+        """Mock named_parameters method expected by weight update code."""
+        return self._parameters.items()
 
     def load_weights(self, weights):  # signature: list[(name, tensor)]
         for name, tensor in weights:

@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
-Integration verification script - checks that our actual implementation
+Integration verification script - checks     for pattern in required_patterns:
+        if not re.search(pattern, content, re.IGNORECASE):
+            print(f"[FAIL] Missing implementation pattern: {pattern}")
+            return False
+    
+    print("[PASS] health_check_active implementation verified")ur actual implementation
 matches the tested logic without running the full engine.
 """
 
@@ -10,11 +15,11 @@ import os
 
 def verify_output_processor_implementation():
     """Verify that our finalize_and_abort_all implementation is present."""
-    print("🔍 Verifying OutputProcessor.finalize_and_abort_all implementation...")
+    print("[INFO] Verifying OutputProcessor.finalize_and_abort_all implementation...")
     
     output_processor_path = "vllm/v1/engine/output_processor.py"
     if not os.path.exists(output_processor_path):
-        print(f"❌ File not found: {output_processor_path}")
+        print(f"[FAIL] File not found: {output_processor_path}")
         return False
     
     with open(output_processor_path, 'r', encoding='utf-8') as f:
@@ -22,7 +27,7 @@ def verify_output_processor_implementation():
     
     # Check for method signature
     if "def finalize_and_abort_all(self)" not in content:
-        print("❌ finalize_and_abort_all method not found")
+        print("[FAIL] finalize_and_abort_all method not found")
         return False
     
     # Check for key implementation elements
@@ -37,20 +42,20 @@ def verify_output_processor_implementation():
     
     for pattern in required_patterns:
         if not re.search(pattern, content, re.IGNORECASE):
-            print(f"❌ Missing implementation pattern: {pattern}")
+            print(f"[FAIL] Missing implementation pattern: {pattern}")
             return False
     
-    print("✅ finalize_and_abort_all implementation verified")
+    print("[PASS] finalize_and_abort_all implementation verified")
     return True
 
 
 def verify_async_llm_implementation():
     """Verify that our abort_all_active implementation is present."""
-    print("🔍 Verifying AsyncLLM.abort_all_active implementation...")
+    print("[INFO] Verifying AsyncLLM.abort_all_active implementation...")
     
     async_llm_path = "vllm/v1/engine/async_llm.py"
     if not os.path.exists(async_llm_path):
-        print(f"❌ File not found: {async_llm_path}")
+        print(f"[FAIL] File not found: {async_llm_path}")
         return False
     
     with open(async_llm_path, 'r', encoding='utf-8') as f:
@@ -58,7 +63,7 @@ def verify_async_llm_implementation():
     
     # Check for method signature
     if "async def abort_all_active(self)" not in content:
-        print("❌ abort_all_active method not found")
+        print("[FAIL] abort_all_active method not found")
         return False
     
     # Check for key implementation elements
@@ -70,20 +75,20 @@ def verify_async_llm_implementation():
     
     for pattern in required_patterns:
         if not re.search(pattern, content, re.IGNORECASE):
-            print(f"❌ Missing implementation pattern: {pattern}")
+            print(f"[FAIL] Missing implementation pattern: {pattern}")
             return False
     
-    print("✅ abort_all_active implementation verified")
+    print("[PASS] abort_all_active implementation verified")
     return True
 
 
 def verify_api_server_integration():
     """Verify that the API server endpoint includes interrupt functionality."""
-    print("🔍 Verifying API server interrupt integration...")
+    print("[INFO] Verifying API server interrupt integration...")
     
     api_server_path = "vllm/entrypoints/openai/api_server.py"
     if not os.path.exists(api_server_path):
-        print(f"❌ File not found: {api_server_path}")
+        print(f"[FAIL] File not found: {api_server_path}")
         return False
     
     with open(api_server_path, 'r', encoding='utf-8') as f:
@@ -100,16 +105,16 @@ def verify_api_server_integration():
     
     for pattern in required_patterns:
         if not re.search(pattern, content, re.IGNORECASE):
-            print(f"❌ Missing API server pattern: {pattern}")
+            print(f"[FAIL] Missing API server pattern: {pattern}")
             return False
     
-    print("✅ API server interrupt integration verified")
+    print("[PASS] API server interrupt integration verified")
     return True
 
 
 def verify_imports_and_dependencies():
     """Verify that required imports are present."""
-    print("🔍 Verifying imports and dependencies...")
+    print("[INFO] Verifying imports and dependencies...")
     
     # Check output_processor.py imports FinishReason
     output_processor_path = "vllm/v1/engine/output_processor.py"
@@ -117,16 +122,16 @@ def verify_imports_and_dependencies():
         content = f.read()
     
     if "from vllm.v1.engine import" not in content or "FinishReason" not in content:
-        print("❌ FinishReason import missing from output_processor.py")
+        print("[FAIL] FinishReason import missing from output_processor.py")
         return False
     
-    print("✅ All imports and dependencies verified")
+    print("[PASS] All imports and dependencies verified")
     return True
 
 
 def main():
     """Run all verification checks."""
-    print("🔍 Verifying Weight Update with Interruption Implementation")
+    print("[INFO] Verifying Weight Update with Interruption Implementation")
     print("=" * 65)
     
     checks = [
@@ -144,17 +149,17 @@ def main():
     
     print("=" * 65)
     if all_passed:
-        print("🎉 ALL IMPLEMENTATION CHECKS PASSED!")
+        print("[PASS] ALL IMPLEMENTATION CHECKS PASSED!")
         print("\nThe implementation includes:")
-        print("  ✅ finalize_and_abort_all() method in OutputProcessor")
-        print("  ✅ abort_all_active() method in AsyncLLM")  
-        print("  ✅ interrupt flag handling in API endpoint")
-        print("  ✅ Response field num_interrupted_requests")
-        print("  ✅ Proper error handling and state cleanup")
-        print("\n💡 Ready to test with a live vLLM instance!")
+        print("  [PASS] finalize_and_abort_all() method in OutputProcessor")
+        print("  [PASS] abort_all_active() method in AsyncLLM")  
+        print("  [PASS] interrupt flag handling in API endpoint")
+        print("  [PASS] Response field num_interrupted_requests")
+        print("  [PASS] Proper error handling and state cleanup")
+        print("\n[INFO] Ready to test with a live vLLM instance!")
         return True
     else:
-        print("❌ SOME IMPLEMENTATION CHECKS FAILED!")
+        print("[FAIL] SOME IMPLEMENTATION CHECKS FAILED!")
         print("\nPlease review the missing patterns above.")
         return False
 
