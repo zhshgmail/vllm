@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Mapping, Optional, Union
 
-from vllm import PoolingParams
+from vllm.pooling_params import PoolingParams
 from vllm.inputs import PromptType
 from vllm.lora.request import LoRARequest
 from vllm.outputs import RequestOutput

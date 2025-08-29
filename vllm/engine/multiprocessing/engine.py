@@ -9,7 +9,9 @@ from typing import Iterator, List, Optional, Union
 import cloudpickle
 import zmq
 
-from vllm import AsyncEngineArgs, SamplingParams
+from vllm.engine.arg_utils import AsyncEngineArgs   # new location
+from vllm.sampling_params import SamplingParams     # has long lived here
+
 from vllm.config import VllmConfig
 from vllm.engine.llm_engine import LLMEngine
 # yapf conflicts with isort for this block
